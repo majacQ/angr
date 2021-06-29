@@ -10,7 +10,7 @@ from ...protos import primitives_pb2
 l = logging.getLogger(name=__name__)
 
 
-class FunctionParser():
+class FunctionParser:
     """
     The implementation of the serialization methods for the <Function> class.
     """
