@@ -1,3 +1,4 @@
+# pylint:disable=wrong-import-position
 from .analysis import Analysis, AnalysesHub
 from ..misc.ux import deprecated
 
@@ -36,4 +37,11 @@ from .init_finder import InitializationFinder
 from .complete_calling_conventions import CompleteCallingConventionsAnalysis
 from .typehoon import Typehoon
 from .proximity_graph import ProximityGraphAnalysis
+  <<<<<<< feat/state_graph_recovery
 from .state_graph_recovery import StateGraphRecoveryAnalysis
+  =======
+from .vtable import VtableFinder
+from .find_objects_static import StaticObjectFinder
+from .class_identifier import ClassIdentifier
+from .flirt import FlirtAnalysis
+  >>>>>>> master

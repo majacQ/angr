@@ -13,11 +13,12 @@ from ....errors import UnsupportedNodeTypeError
 from ... import Analysis, register_analysis
 from ..region_identifier import MultiNode
 from ..structurer import (SequenceNode, CodeNode, ConditionNode, ConditionalBreakNode, LoopNode, BreakNode,
-                         SwitchCaseNode, ContinueNode)
+                         SwitchCaseNode, ContinueNode, CascadingConditionNode)
 from .base import BaseStructuredCodeGenerator, InstructionMapping, PositionMapping, PositionMappingElement
 
 if TYPE_CHECKING:
     from angr.knowledge_plugins.variables.variable_manager import VariableManagerInternal
+    from angr.knowledge_plugins.functions import Function
 
 
 l = logging.getLogger(name=__name__)
@@ -84,7 +85,7 @@ class CConstruct:
                             addr_to_pos.add_mapping(obj.tags['ins_addr'], pos)
 
                     # add all variables, constants, and function calls to map_pos_to_node for highlighting
-                    if isinstance(obj, (CVariable, CConstant)):
+                    if isinstance(obj, (CVariable, CConstant, CStructField)):
                         pos_to_node.add_mapping(pos, len(s), obj)
                     elif isinstance(obj, CFunctionCall):
                         if obj not in used_func_calls:
@@ -141,13 +142,15 @@ class CFunction(CConstruct):  # pylint:disable=abstract-method
     Represents a function in C.
     """
 
-    __slots__ = ('name', 'functy', 'arg_list', 'statements', 'variables_in_use', 'variable_manager', 'demangled_name', )
+    __slots__ = ('addr', 'name', 'functy', 'arg_list', 'statements', 'variables_in_use', 'variable_manager',
+                 'demangled_name', )
 
-    def __init__(self, name, functy: SimTypeFunction, arg_list: List['CExpression'], statements, variables_in_use,
+    def __init__(self, addr, name, functy: SimTypeFunction, arg_list: List['CVariable'], statements, variables_in_use,
                  variable_manager, demangled_name=None, **kwargs):
 
         super().__init__(**kwargs)
 
+        self.addr = addr
         self.name = name
         self.functy = functy
         self.arg_list = arg_list
@@ -160,13 +163,20 @@ class CFunction(CConstruct):  # pylint:disable=abstract-method
 
         unified_to_var_and_types: Dict[SimVariable,Set[Tuple[CVariable,SimType]]] = defaultdict(set)
 
+        arg_set: Set[SimVariable] = set()
+        for arg in self.arg_list:
+            if arg.unified_variable is not None:
+                arg_set.add(arg.unified_variable)
+            else:
+                arg_set.add(arg.variable)
+
         # output each variable and its type
         for var, cvar in self.variables_in_use.items():
             if isinstance(var, SimMemoryVariable) and not isinstance(var, SimStackVariable):
                 # Skip all memory variables
                 continue
 
-            if cvar in self.arg_list:
+            if var in arg_set or cvar.unified_variable in arg_set:
                 continue
 
             unified_var = self.variable_manager.unified_variable(var)
@@ -197,29 +207,45 @@ class CFunction(CConstruct):  # pylint:disable=abstract-method
                 # this should never happen, but pylint complains
                 continue
 
-            for i, var_type in enumerate(set(typ for _, typ in cvar_and_vartypes)):
-                if i:
-                    yield "|", None
-
-                if isinstance(var_type, SimType):
-                    yield var_type.c_repr(), None
-                else:
-                    yield str(var_type), None
-
-            yield " ", None
             if variable.name:
-                yield variable.name, cvariable
+                name = variable.name
             elif isinstance(variable, SimTemporaryVariable):
-                yield "tmp_%d" % variable.tmp_id, cvariable
+                name = "tmp_%d" % variable.tmp_id
             else:
-                yield str(variable), cvariable
+                name = str(variable)
+
+            if len(cvar_and_vartypes) == 1:
+                # a single type. let's be as C as possible
+                _, var_type = next(iter(cvar_and_vartypes), (None, None))
+                if isinstance(var_type, SimType):
+                    raw_type_str = var_type.c_repr(name=name)
+                else:
+                    raw_type_str = '%s %s' % (var_type, name)
+
+                assert name in raw_type_str
+                type_pre, type_post = raw_type_str.split(name, 1)
+                yield type_pre, None
+                yield name, cvariable
+                yield type_post, None
+            else:
+                # multiple types...
+                for i, var_type in enumerate(set(typ for _, typ in cvar_and_vartypes)):
+                    if i:
+                        yield "|", None
+
+                    if isinstance(var_type, SimType):
+                        yield var_type.c_repr(), None
+                    else:
+                        yield str(var_type), None
+
+                yield " ", None
+                yield name, cvariable
             yield ";", None
 
             loc_repr = variable.loc_repr(self.codegen.project.arch)
             yield "  // ", None
             yield loc_repr, None
             yield "\n", None
-
 
     def c_repr_chunks(self, indent=0, asexpr=False):
 
@@ -240,11 +266,17 @@ class CFunction(CConstruct):  # pylint:disable=abstract-method
         brace = CClosingObject("{")
         yield "(", paren
         for i, (arg_type, arg) in enumerate(zip(self.functy.args, self.arg_list)):
-            yield arg_type.c_repr(), None
-            yield " ", None
-            yield from arg.c_repr_chunks()
-            if i != len(self.arg_list) - 1:
+            if i:
                 yield ", ", None
+
+            variable = arg.unified_variable if arg.unified_variable is not None else arg.variable
+            raw_type_str = arg_type.c_repr(name=variable.name)
+            assert variable.name in raw_type_str
+            type_pre, type_post = raw_type_str.split(variable.name)
+
+            yield type_pre, None
+            yield variable.name, arg
+            yield type_post, None
         yield ")", paren
         # function body
         if self.codegen.braces_on_own_lines:
@@ -483,24 +515,25 @@ class CForLoop(CStatement):
         yield "}", brace
         yield '\n', None
 
+
 class CIfElse(CStatement):
     """
     Represents an if-else construct in C.
     """
 
-    __slots__ = ('condition', 'true_node', 'false_node', 'tags')
+    __slots__ = ('condition_and_nodes', 'else_node', 'tags')
 
-    def __init__(self, condition, true_node=None, false_node=None, tags=None, **kwargs):
+    def __init__(self, condition_and_nodes: List[Tuple[CExpression,Optional[CStatement]]], else_node=None, tags=None,
+                 **kwargs):
 
         super().__init__(**kwargs)
 
-        self.condition = condition
-        self.true_node = true_node
-        self.false_node = false_node
+        self.condition_and_nodes = condition_and_nodes
+        self.else_node = else_node
         self.tags = tags
 
-        if self.true_node is None and self.false_node is None:
-            raise ValueError("'true_node' and 'false_node' cannot be both unspecified.")
+        if not self.condition_and_nodes:
+            raise ValueError("You must specify at least one condition")
 
     def c_repr_chunks(self, indent=0, asexpr=False):
 
@@ -508,24 +541,38 @@ class CIfElse(CStatement):
         paren = CClosingObject("(")
         brace = CClosingObject("{")
 
-        yield indent_str, None
-        yield "if ", self
-        yield "(", paren
-        yield from self.condition.c_repr_chunks()
-        yield ")", paren
-        if self.codegen.braces_on_own_lines:
+        first_node = True
+
+        for condition, node in self.condition_and_nodes:
+
+            if first_node:
+                first_node = False
+                yield indent_str, None
+            else:
+                if self.codegen.braces_on_own_lines:
+                    yield "\n", None
+                    yield indent_str, None
+                else:
+                    yield " "
+                yield "else ", self
+
+            yield "if ", self
+            yield "(", paren
+            yield from condition.c_repr_chunks()
+            yield ")", paren
+            if self.codegen.braces_on_own_lines:
+                yield "\n", self
+                yield indent_str, None
+            else:
+                yield " ", None
+            yield "{", brace
             yield "\n", self
+            if node is not None:
+                yield from node.c_repr_chunks(indent=indent + INDENT_DELTA)
             yield indent_str, None
-        else:
-            yield " ", None
-        yield "{", brace
-        yield "\n", self
-        yield from self.true_node.c_repr_chunks(indent=indent + INDENT_DELTA)
-        yield indent_str, None
-        yield "}", brace
+            yield "}", brace
 
-
-        if self.false_node is not None:
+        if self.else_node is not None:
             brace = CClosingObject("{")
 
             if self.codegen.braces_on_own_lines:
@@ -541,11 +588,10 @@ class CIfElse(CStatement):
                 yield " ", None
             yield "{", brace
             yield "\n", self
-            yield from self.false_node.c_repr_chunks(indent=indent + INDENT_DELTA)
+            yield from self.else_node.c_repr_chunks(indent=indent + INDENT_DELTA)
             yield indent_str, None
             yield "}", brace
         yield "\n", self
-
 
 
 class CIfBreak(CStatement):
@@ -716,7 +762,7 @@ class CFunctionCall(CStatement, CExpression):
         super().__init__(**kwargs)
 
         self.callee_target = callee_target
-        self.callee_func = callee_func
+        self.callee_func: Optional['Function'] = callee_func
         self.args = args if args is not None else [ ]
         self.returning = returning
         self.ret_expr = ret_expr
@@ -1400,6 +1446,7 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
             SequenceNode: self._handle_Sequence,
             LoopNode: self._handle_Loop,
             ConditionNode: self._handle_Condition,
+            CascadingConditionNode: self._handle_CascadingCondition,
             ConditionalBreakNode: self._handle_ConditionalBreak,
             MultiNode: self._handle_MultiNode,
             Block: self._handle_AILBlock,
@@ -1480,9 +1527,9 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
 
         self._memo = None  # clear the memo since it's useless now
 
-        self.cfunc = CFunction(self._func.name, self._func.prototype, arg_list, obj, self._variables_in_use,
-                          self._variable_kb.variables[self._func.addr], demangled_name=self._func.demangled_name,
-                          codegen=self)
+        self.cfunc = CFunction(self._func.addr, self._func.name, self._func.prototype, arg_list, obj,
+                               self._variables_in_use, self._variable_kb.variables[self._func.addr],
+                               demangled_name=self._func.demangled_name, codegen=self)
         self._variables_in_use = None
 
         self.regenerate_text()
@@ -1656,14 +1703,32 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
         else:
             raise NotImplementedError()
 
-    def _handle_Condition(self, condition_node):
+    def _handle_Condition(self, condition_node: ConditionNode):
         tags = {'ins_addr': condition_node.addr}
 
-        code = CIfElse(self._handle(condition_node.condition),
-                       true_node=self._handle(condition_node.true_node, is_expr=False)
-                       if condition_node.true_node else None,
-                       false_node=self._handle(condition_node.false_node, is_expr=False)
-                       if condition_node.false_node else None,
+        condition_and_nodes = [
+            (self._handle(condition_node.condition),
+             self._handle(condition_node.true_node, is_expr=False) if condition_node.true_node else None)
+        ]
+
+        else_node = self._handle(condition_node.false_node, is_expr=False) if condition_node.false_node else None
+
+        code = CIfElse(condition_and_nodes,
+                       else_node=else_node,
+                       tags=tags,
+                       codegen=self,
+                       )
+        return code
+
+    def _handle_CascadingCondition(self, cond_node: CascadingConditionNode):
+        tags = {'ins_addr': cond_node.addr}
+
+        condition_and_nodes = [(self._handle(cond), self._handle(node, is_expr=False))
+                               for cond, node in cond_node.condition_and_nodes]
+        else_node = self._handle(cond_node.else_node) if cond_node.else_node is not None else None
+
+        code = CIfElse(condition_and_nodes,
+                       else_node=else_node,
                        tags=tags,
                        codegen=self,
                        )
